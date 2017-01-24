@@ -86,6 +86,7 @@ static PyObject *PySSLEOFErrorObject;
 static PyObject *err_codes_to_names;
 static PyObject *err_names_to_codes;
 static PyObject *lib_codes_to_names;
+static PyObject *verify_codes_to_names;
 
 struct py_ssl_error_code {
     const char *mnemonic;
@@ -385,13 +386,15 @@ static PyType_Spec sslerror_type_spec = {
 };
 
 static void
-fill_and_set_sslerror(PyObject *type, int ssl_errno, const char *errstr,
-                      int lineno, unsigned long errcode)
+fill_and_set_sslerror(PyObject *type,
+                      int ssl_errno, const char *errstr,
+                      int lineno, unsigned long errcode, int verifycode)
 {
-    PyObject *err_value = NULL, *reason_obj = NULL, *lib_obj = NULL;
+    PyObject *err_value = NULL, *reason_obj = NULL, *lib_obj = NULL, *verify_obj = NULL;
     PyObject *init_value, *msg, *key;
     _Py_IDENTIFIER(reason);
     _Py_IDENTIFIER(library);
+    _Py_IDENTIFIER(verification);
 
     if (errcode != 0) {
         int lib, reason;
@@ -421,7 +424,21 @@ fill_and_set_sslerror(PyObject *type, int ssl_errno, const char *errstr,
     if (errstr == NULL)
         errstr = "unknown error";
 
-    if (reason_obj && lib_obj)
+    if (verifycode != 0) {
+        key = PyLong_FromLong(verifycode);
+        if (key == NULL)
+            goto fail;
+        verify_obj = PyDict_GetItem(verify_codes_to_names, key);
+        Py_DECREF(key);
+        if (verify_obj == NULL) {
+          PyErr_Clear();
+        }
+    }
+
+    if (reason_obj && lib_obj && verify_obj)
+        msg = PyUnicode_FromFormat("[%S: %S] %s (%S) (_ssl.c:%d)",
+                                   lib_obj, reason_obj, errstr, verify_obj, lineno);
+    else if (reason_obj && lib_obj)
         msg = PyUnicode_FromFormat("[%S: %S] %s (_ssl.c:%d)",
                                    lib_obj, reason_obj, errstr, lineno);
     else if (lib_obj)
@@ -448,6 +465,10 @@ fill_and_set_sslerror(PyObject *type, int ssl_errno, const char *errstr,
     if (lib_obj == NULL)
         lib_obj = Py_None;
     if (_PyObject_SetAttrId(err_value, &PyId_library, lib_obj))
+        goto fail;
+    if (verify_obj == NULL)
+        verify_obj = Py_None;
+    if (_PyObject_SetAttrId(err_value, &PyId_verification, verify_obj))
         goto fail;
     PyErr_SetObject(type, err_value);
 fail:
@@ -531,7 +552,7 @@ PySSL_SetError(PySSLSocket *obj, int ret, char *filename, int lineno)
             errstr = "Invalid error code";
         }
     }
-    fill_and_set_sslerror(type, p, errstr, lineno, e);
+    fill_and_set_sslerror(type, p, errstr, lineno, e, obj->ssl->verify_result);
     ERR_clear_error();
     return NULL;
 }
@@ -543,7 +564,7 @@ _setSSLError (char *errstr, int errcode, char *filename, int lineno) {
         errcode = ERR_peek_last_error();
     else
         errcode = 0;
-    fill_and_set_sslerror(PySSLErrorObject, errcode, errstr, lineno, errcode);
+    fill_and_set_sslerror(PySSLErrorObject, errcode, errstr, lineno, errcode, 0);
     ERR_clear_error();
     return NULL;
 }
@@ -4616,6 +4637,7 @@ PyInit__ssl(void)
     PySocketModule_APIObject *socket_api;
     struct py_ssl_error_code *errcode;
     struct py_ssl_library_code *libcode;
+    int verifycode;
 
     if (PyType_Ready(&PySSLContext_Type) < 0)
         return NULL;
@@ -4906,6 +4928,23 @@ PyInit__ssl(void)
         libcode++;
     }
     if (PyModule_AddObject(m, "lib_codes_to_names", lib_codes_to_names))
+        return NULL;
+
+    verify_codes_to_names = PyDict_New();
+    if (verify_codes_to_names == NULL)
+        return NULL;
+    for (verifycode = 0; verifycode <= X509_V_ERR_PROXY_SUBJECT_NAME_VIOLATION; verifycode++) {
+        PyObject *mnemo, *key;
+        key = PyLong_FromLong(verifycode);
+        mnemo = PyUnicode_FromString(X509_verify_cert_error_string(verifycode));
+        if (key == NULL || mnemo == NULL)
+            return NULL;
+        if (PyDict_SetItem(verify_codes_to_names, key, mnemo))
+            return NULL;
+        Py_DECREF(key);
+        Py_DECREF(mnemo);
+    }
+    if (PyModule_AddObject(m, "verify_codes_to_names", verify_codes_to_names))
         return NULL;
 
     /* OpenSSL version */
